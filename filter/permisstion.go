@@ -94,6 +94,7 @@ func (p *PermissionFilter) DoFilter(next flux.FilterHandler) flux.FilterHandler 
 			return next(ctx)
 		}
 		// 没有任何权限校验定义
+		endpoint := ctx.Endpoint()
 		size := len(endpoint.Permissions)
 		if size == 0 && !endpoint.Permission.IsValid() {
 			return next(ctx)
