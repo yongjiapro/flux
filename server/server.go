@@ -6,7 +6,6 @@ import (
 	"github.com/bytepowered/flux"
 	"github.com/bytepowered/flux/ext"
 	"github.com/bytepowered/flux/logger"
-	"github.com/bytepowered/flux/server/debugs"
 	"github.com/bytepowered/flux/webmidware"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cast"
@@ -127,8 +126,8 @@ func (s *HttpWebServer) Initial() error {
 	}
 	// - Debug特性支持：默认关闭，需要配置开启
 	if s.httpConfig.GetBool(HttpWebServerConfigKeyFeatureDebugEnable) {
-		http.DefaultServeMux.Handle("/debug/endpoints", debugs.NewDebugQueryEndpointHandler(s.bindEndpoint))
-		http.DefaultServeMux.Handle("/debug/services", debugs.NewDebugQueryServiceHandler())
+		http.DefaultServeMux.Handle("/debug/endpoints", NewDebugQueryEndpointHandler(s.bindEndpoint))
+		http.DefaultServeMux.Handle("/debug/services", NewDebugQueryServiceHandler())
 		http.DefaultServeMux.Handle("/debug/metrics", promhttp.Handler())
 	}
 
