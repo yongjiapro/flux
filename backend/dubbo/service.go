@@ -53,8 +53,8 @@ func init() {
 type (
 	// ReferenceOptionsFunc DubboReference配置函数，可外部化配置Dubbo Reference
 	ReferenceOptionsFunc func(*flux.BackendService, *flux.Configuration, *dubgo.ReferenceConfig) *dubgo.ReferenceConfig
-	// ParameterAssembleFunc Dubbo调用参数封装函数，可外部化配置为其它协议的值对象
-	ParameterAssembleFunc func(arguments []flux.Argument, context flux.Context) (types []string, values interface{}, err error)
+	// ArgumentsAssembleFunc Dubbo调用参数封装函数，可外部化配置为其它协议的值对象
+	ArgumentsAssembleFunc func(arguments []flux.Argument, context flux.Context) (types []string, values interface{}, err error)
 )
 
 // GetRegistryGlobalAlias 获取默认DubboRegistry全局别名配置
@@ -71,18 +71,18 @@ func SetRegistryGlobalAlias(alias map[string]string) {
 type BackendTransportService struct {
 	// 可外部配置
 	ReferenceOptionsFuncs []ReferenceOptionsFunc
-	ParameterAssembleFunc ParameterAssembleFunc
+	ArgumentsAssembleFunc ArgumentsAssembleFunc
 	// 内部私有
 	traceEnable   bool
 	configuration *flux.Configuration
-	referenceMu   sync.RWMutex
+	serviceMutex  sync.RWMutex
 }
 
 // NewDubboBackendTransport New dubbo backend instance
 func NewDubboBackendTransport() flux.BackendTransport {
 	return &BackendTransportService{
 		ReferenceOptionsFuncs: make([]ReferenceOptionsFunc, 0),
-		ParameterAssembleFunc: ArgumentsAssemble,
+		ArgumentsAssembleFunc: DefaultArgumentsAssembleFunc,
 	}
 }
 
@@ -110,8 +110,8 @@ func (b *BackendTransportService) Init(config *flux.Configuration) error {
 	if nil == b.ReferenceOptionsFuncs {
 		b.ReferenceOptionsFuncs = make([]ReferenceOptionsFunc, 0)
 	}
-	if pkg.IsNil(b.ParameterAssembleFunc) {
-		b.ParameterAssembleFunc = ArgumentsAssemble
+	if pkg.IsNil(b.ArgumentsAssembleFunc) {
+		b.ArgumentsAssembleFunc = DefaultArgumentsAssembleFunc
 	}
 	// 修改默认Consumer配置
 	consumerc := dubgo.GetConsumerConfig()
@@ -144,7 +144,7 @@ func (b *BackendTransportService) Exchange(ctx flux.Context) *flux.ServeError {
 
 // Invoke invoke backend service with context
 func (b *BackendTransportService) Invoke(service flux.BackendService, ctx flux.Context) (interface{}, *flux.ServeError) {
-	types, values, err := b.ParameterAssembleFunc(service.Arguments, ctx)
+	types, values, err := b.ArgumentsAssembleFunc(service.Arguments, ctx)
 	if nil != err {
 		return nil, &flux.ServeError{
 			StatusCode: flux.StatusServerError,
@@ -160,13 +160,16 @@ func (b *BackendTransportService) Invoke(service flux.BackendService, ctx flux.C
 // ExecuteWith execute backend service with arguments
 func (b *BackendTransportService) ExecuteWith(types []string, values interface{}, service flux.BackendService, ctx flux.Context) (interface{}, *flux.ServeError) {
 	if b.traceEnable {
-		logger.TraceContext(ctx).Infow("Dubbo invoking", "values", values, "types", types, "attrs", ctx.Attributes())
+		logger.TraceContext(ctx).Infow("Dubbo invoking",
+			"backend-service", service.ServiceID(), "arg-values", values, "arg-types", types, "attrs", ctx.Attributes())
 	}
 	// Note: must be map[string]string
 	// See: dubbo-go@v1.5.1/common/proxy/proxy.go:150
 	attachments, err := cast.ToStringMapStringE(ctx.Attributes())
 	if nil != err {
-		logger.TraceContext(ctx).Errorw("Dubbo attachment error", "error", err)
+		logger.TraceContext(ctx).Errorw("Dubbo attachment error",
+			"backend-service", service.ServiceID(),
+			"error", err)
 		return nil, &flux.ServeError{
 			StatusCode: flux.StatusServerError,
 			ErrorCode:  flux.ErrorCodeGatewayInternal,
@@ -177,7 +180,8 @@ func (b *BackendTransportService) ExecuteWith(types []string, values interface{}
 	goctx := context.WithValue(ctx.Context(), constant.AttachmentKey, attachments)
 	generic := b.LoadGenericService(&service)
 	if resp, err := generic.Invoke(goctx, []interface{}{service.Method, types, values}); err != nil {
-		logger.TraceContext(ctx).Errorw("Dubbo rpc error", "error", err)
+		logger.TraceContext(ctx).Errorw("Dubbo rpc error",
+			"backend-service", service.ServiceID(), "error", err)
 		return nil, &flux.ServeError{
 			StatusCode: flux.StatusBadGateway,
 			ErrorCode:  flux.ErrorCodeGatewayBackend,
@@ -189,10 +193,10 @@ func (b *BackendTransportService) ExecuteWith(types []string, values interface{}
 			text, err := internalJSON.MarshalToString(resp)
 			ctxLogger := logger.TraceContext(ctx)
 			if nil == err {
-				ctxLogger.Infow("Dubbo received response", "response.json", text)
+				ctxLogger.Infow("Dubbo received response", "backend-service", service.ServiceID(), "response.json", text)
 			} else {
 				ctxLogger.Infow("Dubbo received response",
-					"response.type", reflect.TypeOf(resp), "response.data", fmt.Sprintf("%+v", resp))
+					"backend-service", service.ServiceID(), "response.type", reflect.TypeOf(resp), "response.data", fmt.Sprintf("%+v", resp))
 			}
 		}
 		return resp, nil
@@ -200,32 +204,32 @@ func (b *BackendTransportService) ExecuteWith(types []string, values interface{}
 }
 
 // LoadGenericService create and cache dubbo generic service
-func (b *BackendTransportService) LoadGenericService(service *flux.BackendService) *dubgo.GenericService {
-	b.referenceMu.Lock()
-	defer b.referenceMu.Unlock()
-	if cached := dubgo.GetConsumerService(service.Interface); nil != cached {
-		return cached.(*dubgo.GenericService)
+func (b *BackendTransportService) LoadGenericService(definition *flux.BackendService) *dubgo.GenericService {
+	b.serviceMutex.Lock()
+	defer b.serviceMutex.Unlock()
+	if service := dubgo.GetConsumerService(definition.Interface); nil != service {
+		return service.(*dubgo.GenericService)
 	}
-	newRef := NewReference(service.Interface, service, b.configuration)
+	newRef := NewReference(definition.Interface, definition, b.configuration)
 	// Options
 	const msg = "Dubbo option-func return nil reference"
 	for _, optsFunc := range b.ReferenceOptionsFuncs {
 		if nil != optsFunc {
-			newRef = pkg.RequireNotNil(optsFunc(service, b.configuration, newRef), msg).(*dubgo.ReferenceConfig)
+			newRef = pkg.RequireNotNil(optsFunc(definition, b.configuration, newRef), msg).(*dubgo.ReferenceConfig)
 		}
 	}
-	logger.Infow("Create dubbo reference-config, referring", "interface", service.Interface)
-	generic := dubgo.NewGenericService(service.Interface)
-	dubgo.SetConsumerService(generic)
-	newRef.Refer(generic)
-	newRef.Implement(generic)
+	logger.Infow("Create dubbo generic service: ING", "interface", definition.Interface)
+	service := dubgo.NewGenericService(definition.Interface)
+	dubgo.SetConsumerService(service)
+	newRef.Refer(service)
+	newRef.Implement(service)
 	t := b.configuration.GetDuration(configKeyReferenceDelay)
 	if t == 0 {
-		t = time.Millisecond * 30
+		t = time.Millisecond * 10
 	}
 	<-time.After(t)
-	logger.Infow("Create dubbo reference-config: OK", "interface", service.Interface)
-	return generic
+	logger.Infow("Create dubbo generic service: OK", "interface", definition.Interface)
+	return service
 }
 
 func newConsumerRegistry(config *flux.Configuration) (string, *dubgo.RegistryConfig) {
@@ -250,14 +254,15 @@ func newConsumerRegistry(config *flux.Configuration) (string, *dubgo.RegistryCon
 
 func NewReference(refid string, service *flux.BackendService, config *flux.Configuration) *dubgo.ReferenceConfig {
 	logger.Infow("Create dubbo reference-config",
-		"service", service.Interface, "remote-host", service.RemoteHost, "rpc-group", service.RpcGroup, "rpc-version", service.RpcVersion)
+		"service", service.Interface, "remote-host", service.RemoteHost,
+		"rpc-group", service.AttrRpcGroup(), "rpc-version", service.AttrRpcVersion())
 	ref := dubgo.NewReferenceConfig(refid, context.Background())
 	ref.Url = service.RemoteHost
 	ref.InterfaceName = service.Interface
-	ref.Version = service.RpcVersion
-	ref.Group = service.RpcGroup
-	ref.RequestTimeout = service.RpcTimeout
-	ref.Retries = service.RpcRetries
+	ref.Version = service.AttrRpcVersion()
+	ref.Group = service.AttrRpcGroup()
+	ref.RequestTimeout = service.AttrRpcTimeout()
+	ref.Retries = service.AttrRpcRetries()
 	ref.Cluster = config.GetString("cluster")
 	ref.Protocol = config.GetString("protocol")
 	ref.Loadbalance = config.GetString("load-balance")

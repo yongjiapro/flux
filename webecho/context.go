@@ -10,16 +10,27 @@ import (
 )
 
 const (
-	keyWebContext = "$internal.web.adapted.context"
+	keyWebContext     = "$internal.web.adapted.context"
+	keyWebBodyDecoder = "$internal.web.adapted.body.decoder"
 )
 
 var _ flux.WebContext = new(AdaptWebContext)
+
+func NewAdaptWebContext(echoc echo.Context, decoder flux.WebRequestBodyDecoder) *AdaptWebContext {
+	echoc.Set(keyWebBodyDecoder, decoder)
+	return &AdaptWebContext{
+		echoc:   echoc,
+		decoder: decoder,
+	}
+}
 
 // AdaptWebContext 默认实现的基于echo框架的WebContext
 // 注意：保持AdaptWebContext的公共访问性
 type AdaptWebContext struct {
 	echoc      echo.Context
+	decoder    flux.WebRequestBodyDecoder
 	pathValues url.Values
+	bodyValues url.Values
 }
 
 func (c *AdaptWebContext) Method() string {
@@ -59,6 +70,10 @@ func (c *AdaptWebContext) AddRequestHeader(name, value string) {
 	c.echoc.Request().Header.Add(name, value)
 }
 
+func (c *AdaptWebContext) RemoveRequestHeader(name string) {
+	c.echoc.Request().Header.Del(name)
+}
+
 func (c *AdaptWebContext) HeaderValues() (http.Header, bool) {
 	return c.echoc.Request().Header, true
 }
@@ -84,11 +99,10 @@ func (c *AdaptWebContext) PathValues() url.Values {
 }
 
 func (c *AdaptWebContext) FormValues() url.Values {
-	form, err := c.echoc.FormParams()
-	if nil != err {
-		panic(err)
+	if c.bodyValues == nil {
+		c.bodyValues = c.decoder(c)
 	}
-	return form
+	return c.bodyValues
 }
 
 func (c *AdaptWebContext) CookieValues() []*http.Cookie {
@@ -104,7 +118,7 @@ func (c *AdaptWebContext) PathValue(name string) string {
 }
 
 func (c *AdaptWebContext) FormValue(name string) string {
-	return c.echoc.FormValue(name)
+	return c.FormValues().Get(name)
 }
 
 func (c *AdaptWebContext) CookieValue(name string) (*http.Cookie, bool) {
@@ -179,7 +193,11 @@ func (c *AdaptWebContext) HttpResponseWriter() (http.ResponseWriter, error) {
 func toAdaptWebContext(echo echo.Context) flux.WebContext {
 	webc, ok := echo.Get(keyWebContext).(*AdaptWebContext)
 	if !ok {
-		webc = &AdaptWebContext{echoc: echo}
+		decoder, ok := echo.Get(keyWebBodyDecoder).(flux.WebRequestBodyDecoder)
+		if !ok {
+			decoder = DefaultRequestBodyDecoder
+		}
+		webc = NewAdaptWebContext(echo, decoder)
 		echo.Set(keyWebContext, webc)
 	}
 	return webc
